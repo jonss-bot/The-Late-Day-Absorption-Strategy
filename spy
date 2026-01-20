@@ -1,0 +1,115 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.historical import StockHistoricalDataClient
+from datetime import datetime, timedelta
+from alpaca.data.enums import DataFeed
+
+class AbsorptionStrategy:
+    def __init__(self, api_key, secret_key, symbol="SPY"):
+        self.client = StockHistoricalDataClient(api_key, secret_key)
+        self.symbol = symbol
+        self.data = None
+        self.signals = None
+
+    def fetch_data(self, days=730):
+        print(f"--- Fetching {days} days of data ---")
+        # 1. Alpaca Minute Data
+        req = StockBarsRequest(
+            symbol_or_symbols=self.symbol,
+            timeframe=TimeFrame.Minute,
+            start=datetime.now() - timedelta(days=days),
+            end=datetime.now(),
+            feed=DataFeed.IEX,
+            adjustment="all"
+        )
+        self.data = self.client.get_stock_bars(req).df.reset_index(level=0, drop=True)
+        self.data.index = self.data.index.tz_convert('America/New_York').tz_localize(None)
+        
+        # 2. Yahoo Hourly & VIX
+        self.yf_data = yf.download(self.symbol, period=f"{days}d", interval="1h", prepost=True)
+        if isinstance(self.yf_data.columns, pd.MultiIndex): self.yf_data.columns = self.yf_data.columns.get_level_values(0)
+        self.yf_data.index = self.yf_data.index.tz_localize(None)
+        
+        self.vix = yf.download("^VIX", period=f"{days}d", interval="1d")
+        self.vix.index = self.vix.index.tz_localize(None)
+
+    def generate_signals(self):
+        print("--- Generating Alpha Signals ---")
+        df = self.data
+        
+        # Calculate VWAP (9:30 - 16:00)
+        def calc_vwap(d):
+            reg = d[(d.index.hour >= 9) & (d.index.hour < 16)]
+            return ((reg['close'] * reg['volume']).sum()) / (reg['volume'].sum() + 1e-6)
+        
+        vwap_map = df.groupby(df.index.date).apply(calc_vwap)
+        hour_opens = df[df.index.hour == 15].groupby(df.index.date)['open'].first()
+        
+        # Filter for 15:59 Candle
+        sig = df[(df.index.hour == 15) & (df.index.minute == 59)].copy()
+        sig['date_key'] = sig.index.date
+        sig['target_vwap'] = sig['date_key'].map(vwap_map)
+        sig['hour_open'] = sig['date_key'].map(hour_opens)
+        
+        # Logic
+        sig['hour_move'] = sig['close'] - sig['hour_open']
+        sig['min_move'] = sig['close'] - sig['open']
+        sig['impact_ratio'] = abs(sig['min_move']) / (abs(sig['hour_move']) + 1e-6)
+        
+        # Entry Criteria
+        self.signals = sig[(abs(sig['hour_move']) > 0.3) & (sig['impact_ratio'] < 0.20)].copy()
+
+    def backtest(self, reward_ratio=2.0):
+        print("--- Executing Backtest ---")
+        def run_trade(row):
+            entry, tp = row['close'], row['target_vwap']
+            dist = tp - entry
+            sl = entry - (dist / reward_ratio)
+            
+            # Post-market bars (4 PM - 8 PM)
+            ah = self.yf_data[(self.yf_data.index.date == row['date_key']) & (self.yf_data.index.hour >= 16)]
+            
+            for _, bar in ah.iterrows():
+                if dist > 0: # Long
+                    if bar['High'] >= tp: return "Win"
+                    if bar['Low'] <= sl: return "Loss"
+                else: # Short
+                    if bar['Low'] <= tp: return "Win"
+                    if bar['High'] >= sl: return "Loss"
+            return "Timeout"
+
+        self.signals['outcome'] = self.signals.apply(run_trade, axis=1)
+        self.signals['r_return'] = np.where(self.signals['outcome'] == 'Win', reward_ratio, 
+                                   np.where(self.signals['outcome'] == 'Loss', -1.0, 0.0))
+        self.signals['equity'] = self.signals['r_return'].cumsum()
+
+    def report(self):
+        # Calculation of metrics
+        trades = self.signals[self.signals['outcome'].isin(['Win', 'Loss'])]
+        win_rate = (trades['outcome'] == 'Win').mean()
+        
+        # Plotting
+        fig, ax1 = plt.subplots(figsize=(14, 6))
+        ax1.plot(self.signals.index, self.signals['equity'], color='green', lw=2, label='Equity (R)')
+        ax1.set_ylabel('Cumulative R', color='green')
+        
+        ax2 = ax1.twinx()
+        ax2.plot(self.vix.index, self.vix['Close'], color='red', alpha=0.3, label='VIX')
+        ax2.set_ylabel('VIX', color='red')
+        
+        plt.title(f"SPY Absorption Strategy | Win Rate: {win_rate:.1%}")
+        plt.show()
+
+# EXECUTION
+API_KEY = "YOUR_API_KEY"
+SECRET_KEY = "YOUR_SECRET_KEY"
+
+strat = AbsorptionStrategy(API_KEY, SECRET_KEY)
+strat.fetch_data(days=730)
+strat.generate_signals()
+strat.backtest()
+strat.report()
