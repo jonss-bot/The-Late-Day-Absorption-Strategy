@@ -1,12 +1,14 @@
 """
 VWAP Mean Reversion Trading System - IBKR API Implementation
+Version 2.0 - Late Start Capable (Can start at 3:30 PM)
 
 This system:
-1. Monitors price action during 3-4 PM hour
-2. Detects absorption patterns at 15:59
-3. Calculates daily VWAP target
-4. Places after-hours trades with 2:1 RR
-5. Manages positions automatically until 8 PM
+1. Fetches historical bars if starting after 9:30 AM
+2. Monitors price action during 3-4 PM hour
+3. Detects absorption patterns at 15:59
+4. Calculates daily VWAP target
+5. Places after-hours trades with 2:1 RR
+6. Manages positions automatically until 8 PM
 
 Recommended symbols: SPY, BAC, XLB, VTI, XLP
 """
@@ -16,7 +18,7 @@ from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
-from ib_async import IB, Stock, MarketOrder, LimitOrder, Order, util
+from ib_async import IB, Stock, MarketOrder, Order, util
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -45,6 +47,7 @@ class Config:
     ABSORPTION_MOVE_THRESHOLD = 0.30  # Hour must move >$0.30
     ABSORPTION_IMPACT_RATIO = 0.20    # Last candle impact <20% of hour move
     RISK_REWARD_RATIO = 2.0           # 2:1 RR
+    MIN_STOP_DISTANCE = 0.10          # Minimum $0.10 stop distance
     
     # Timing
     MARKET_OPEN = time(9, 30)
@@ -144,6 +147,34 @@ class VWAPCalculator:
             pd.DataFrame([new_row])
         ], ignore_index=True)
     
+    def add_bars_bulk(self, symbol: str, bars_list):
+        """Add multiple bars at once (for historical data)"""
+        if not bars_list:
+            return
+            
+        rows = []
+        for bar in bars_list:
+            rows.append({
+                'timestamp': pd.to_datetime(bar.date),
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume
+            })
+        
+        new_df = pd.DataFrame(rows)
+        
+        if symbol not in self.bars:
+            self.bars[symbol] = new_df
+        else:
+            self.bars[symbol] = pd.concat([
+                self.bars[symbol],
+                new_df
+            ], ignore_index=True)
+        
+        logger.info(f"📊 Added {len(rows)} bars for {symbol}")
+    
     def calculate_vwap(self, symbol: str, up_to_time: time = time(15, 59)) -> Optional[float]:
         """
         Calculate VWAP up to specified time
@@ -203,6 +234,12 @@ class VWAPCalculator:
             'hour_close': hour_bars.iloc[-1]['close']
         }
     
+    def get_latest_bar(self, symbol: str):
+        """Get the most recent bar for a symbol"""
+        if symbol not in self.bars or self.bars[symbol].empty:
+            return None
+        return self.bars[symbol].iloc[-1]
+    
     def reset_daily(self):
         """Reset VWAP calculation for new day"""
         self.bars = {}
@@ -219,17 +256,22 @@ class AbsorptionDetector:
     def __init__(self, vwap_calc: VWAPCalculator):
         self.vwap_calc = vwap_calc
     
-    def detect_signal(self, symbol: str, current_bar) -> Optional[AbsorptionSignal]:
+    def detect_signal(self, symbol: str) -> Optional[AbsorptionSignal]:
         """
         Detect absorption signal at 3:59 PM
         
         Args:
             symbol: Stock symbol
-            current_bar: Current 1-minute bar at 3:59
             
         Returns:
             AbsorptionSignal if valid, else None
         """
+        # Get latest bar (should be 3:59 PM bar)
+        latest = self.vwap_calc.get_latest_bar(symbol)
+        if latest is None:
+            logger.warning(f"{symbol}: No current bar available")
+            return None
+        
         # Get hour data (3 PM - 3:59 PM)
         hour_data = self.vwap_calc.get_hour_data(symbol, hour=15)
         if not hour_data:
@@ -244,11 +286,11 @@ class AbsorptionDetector:
         
         # Calculate absorption metrics
         hour_open = hour_data['hour_open']
-        hour_close = current_bar.close
+        hour_close = latest['close']
         hour_move = hour_close - hour_open
         
-        candle_open = current_bar.open
-        candle_close = current_bar.close
+        candle_open = latest['open']
+        candle_close = latest['close']
         candle_move = abs(candle_close - candle_open)
         
         impact_ratio = candle_move / (abs(hour_move) + 1e-6)
@@ -285,7 +327,7 @@ class AbsorptionDetector:
         
         # Calculate position size
         stop_distance = abs(entry_price - stop_loss)
-        if stop_distance < 0.01:  # Minimum stop distance
+        if stop_distance < Config.MIN_STOP_DISTANCE:
             logger.warning(f"{symbol}: Stop distance too small: ${stop_distance:.2f}")
             return None
         
@@ -395,11 +437,41 @@ class IBKRTradingClient:
         self.ib.cancelMktData(contract)
         return price
     
+    async def fetch_historical_bars(self, symbol: str):
+        """
+        Fetch historical 1-minute bars from 9:30 AM today
+        This allows late start (e.g., 3:30 PM) with accurate VWAP
+        """
+        try:
+            contract = await self.get_contract(symbol)
+            
+            # Get today's 1-min bars from market open to now
+            logger.info(f"📥 Fetching historical bars for {symbol}...")
+            
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime='',  # Now
+                durationStr='1 D',  # Today
+                barSizeSetting='1 min',
+                whatToShow='TRADES',
+                useRTH=True,  # Regular trading hours only (9:30-4:00)
+                formatDate=1
+            )
+            
+            if bars:
+                self.vwap_calc.add_bars_bulk(symbol, bars)
+                logger.info(f"✅ Loaded {len(bars)} historical bars for {symbol}")
+            else:
+                logger.warning(f"⚠️  No historical bars received for {symbol}")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch historical bars for {symbol}: {e}")
+    
     async def stream_bars(self, symbol: str):
-        """Stream 1-minute bars for a symbol"""
+        """Stream real-time 5-second bars for a symbol"""
         contract = await self.get_contract(symbol)
         
-        # Request real-time bars (5-second bars)
+        # Request real-time bars (5-second bars aggregated to 1-min)
         bars = self.ib.reqRealTimeBars(
             contract, 
             5,  # 5-second bars
@@ -408,20 +480,27 @@ class IBKRTradingClient:
         )
         
         bars.updateEvent += lambda bars, hasNewBar: self.on_bar_update(symbol, bars)
-        logger.info(f"📊 Started streaming bars for {symbol}")
+        logger.info(f"📊 Started streaming real-time bars for {symbol}")
     
     def on_bar_update(self, symbol: str, bars):
         """Handle new bar updates"""
         if bars:
             latest_bar = bars[-1]
             self.vwap_calc.add_bar(symbol, latest_bar)
-            
-            # Check for signals at 3:59 PM
-            current_time = datetime.now().time()
-            if current_time.hour == 15 and current_time.minute == 59:
-                signal = self.detector.detect_signal(symbol, latest_bar)
-                if signal:
-                    self.pending_signals.append(signal)
+    
+    async def check_for_signals(self):
+        """Check all symbols for absorption signals at 3:59 PM"""
+        logger.info("🔍 Checking for absorption signals at 3:59 PM...")
+        
+        for symbol in Config.SYMBOLS:
+            signal = self.detector.detect_signal(symbol)
+            if signal:
+                self.pending_signals.append(signal)
+        
+        if self.pending_signals:
+            logger.info(f"✅ Found {len(self.pending_signals)} valid signals")
+        else:
+            logger.info("ℹ️  No absorption signals detected today")
     
     async def place_order(self, signal: AbsorptionSignal) -> Optional[int]:
         """
@@ -451,7 +530,7 @@ class IBKRTradingClient:
             
             # Place order
             trade = self.ib.placeOrder(contract, order)
-            await asyncio.sleep(1)  # Wait for fill
+            await asyncio.sleep(2)  # Wait for fill
             
             logger.info(
                 f"📤 ORDER PLACED: {action} {signal.shares} {signal.symbol} @ Market\n"
@@ -495,7 +574,8 @@ class IBKRTradingClient:
             stop_order.totalQuantity = position.shares
             stop_order.orderType = 'STP'
             stop_order.auxPrice = position.stop_loss
-            stop_order.tif = 'GTC'  # Good till cancelled
+            stop_order.tif = 'GTC'
+            stop_order.outsideRth = True  # Allow after-hours
             
             # Take profit order
             profit_order = Order()
@@ -504,6 +584,7 @@ class IBKRTradingClient:
             profit_order.orderType = 'LMT'
             profit_order.lmtPrice = position.take_profit
             profit_order.tif = 'GTC'
+            profit_order.outsideRth = True  # Allow after-hours
             
             # Place orders
             self.ib.placeOrder(contract, stop_order)
@@ -520,6 +601,9 @@ class IBKRTradingClient:
     
     async def check_positions(self):
         """Monitor and manage active positions"""
+        if not self.positions:
+            return
+            
         for symbol in list(self.positions.keys()):
             position = self.positions[symbol]
             
@@ -532,19 +616,19 @@ class IBKRTradingClient:
             if position.direction == TradeDirection.LONG:
                 if current_price >= position.take_profit:
                     logger.info(f"✅ TARGET HIT: {symbol} @ ${current_price:.2f}")
-                    await self.close_position(symbol)
+                    await self.close_position(symbol, current_price)
                 elif current_price <= position.stop_loss:
                     logger.info(f"🛑 STOP HIT: {symbol} @ ${current_price:.2f}")
-                    await self.close_position(symbol)
+                    await self.close_position(symbol, current_price)
             else:  # SHORT
                 if current_price <= position.take_profit:
                     logger.info(f"✅ TARGET HIT: {symbol} @ ${current_price:.2f}")
-                    await self.close_position(symbol)
+                    await self.close_position(symbol, current_price)
                 elif current_price >= position.stop_loss:
                     logger.info(f"🛑 STOP HIT: {symbol} @ ${current_price:.2f}")
-                    await self.close_position(symbol)
+                    await self.close_position(symbol, current_price)
     
-    async def close_position(self, symbol: str):
+    async def close_position(self, symbol: str, current_price: float = None):
         """Close a position"""
         if symbol not in self.positions:
             return
@@ -557,12 +641,15 @@ class IBKRTradingClient:
             # Close position with market order
             action = 'SELL' if position.direction == TradeDirection.LONG else 'BUY'
             order = MarketOrder(action, position.shares)
+            order.outsideRth = True  # Allow after-hours
             
             trade = self.ib.placeOrder(contract, order)
             await asyncio.sleep(1)
             
             # Calculate P&L
-            current_price = await self.get_current_price(symbol)
+            if not current_price:
+                current_price = await self.get_current_price(symbol)
+            
             if current_price:
                 if position.direction == TradeDirection.LONG:
                     pnl = (current_price - position.entry_price) * position.shares
@@ -584,6 +671,10 @@ class IBKRTradingClient:
     
     async def close_all_positions(self):
         """Close all open positions (used at end of day)"""
+        if not self.positions:
+            logger.info("ℹ️  No positions to close")
+            return
+            
         logger.info("🔴 Closing all positions at end of trading window")
         symbols = list(self.positions.keys())
         for symbol in symbols:
@@ -595,17 +686,38 @@ class IBKRTradingClient:
         logger.info("🚀 VWAP MEAN REVERSION TRADING SYSTEM STARTED")
         logger.info("="*80)
         
-        # Reset for new day
-        self.vwap_calc.reset_daily()
-        self.pending_signals = []
+        current_time = datetime.now().time()
         
-        # Start streaming bars for all symbols
+        # If starting late (after 9:30 AM), fetch historical bars
+        if current_time > Config.MARKET_OPEN:
+            logger.info("⏰ Late start detected - fetching historical bars for VWAP calculation...")
+            for symbol in Config.SYMBOLS:
+                await self.fetch_historical_bars(symbol)
+            logger.info("✅ Historical data loaded - VWAP ready to calculate")
+        else:
+            self.vwap_calc.reset_daily()
+        
+        # Start streaming real-time bars for all symbols
         for symbol in Config.SYMBOLS:
             await self.stream_bars(symbol)
         
+        logger.info(f"\n📅 Monitoring {len(Config.SYMBOLS)} symbols: {', '.join(Config.SYMBOLS)}")
+        logger.info(f"⏰ Current time: {datetime.now().strftime('%I:%M %p')}")
+        logger.info(f"🎯 Signal check at: 3:59 PM")
+        logger.info(f"📤 Order entry at: 4:00 PM")
+        logger.info(f"🔚 Force close at: 8:00 PM\n")
+        
         # Main loop
+        signal_checked = False
+        
         while True:
             current_time = datetime.now().time()
+            
+            # Check for signals at 3:59 PM (only once)
+            if (current_time.hour == 15 and current_time.minute == 59 and 
+                not signal_checked):
+                await self.check_for_signals()
+                signal_checked = True
             
             # Execute pending signals at 4:00 PM
             if current_time.hour == 16 and current_time.minute == 0 and self.pending_signals:
@@ -614,14 +726,14 @@ class IBKRTradingClient:
                     await self.place_order(signal)
                 self.pending_signals = []
             
-            # Monitor positions every minute
+            # Monitor positions every 30 seconds (after 4 PM)
             if current_time >= Config.ENTRY_TIME:
                 await self.check_positions()
             
             # Close all positions at 8 PM
             if current_time >= Config.EXIT_DEADLINE:
                 await self.close_all_positions()
-                logger.info("🛑 Trading day complete")
+                logger.info("🛑 Trading day complete - all positions closed")
                 break
             
             # Sleep before next check
@@ -644,7 +756,7 @@ async def main():
         await client.run_trading_day()
         
     except KeyboardInterrupt:
-        logger.info("⚠️ Interrupted by user")
+        logger.info("\n⚠️ Interrupted by user")
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
     finally:
